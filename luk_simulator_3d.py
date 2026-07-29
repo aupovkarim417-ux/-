@@ -31,6 +31,7 @@ import random
 import traceback
 
 import pygame
+import pygame.freetype
 
 
 # ======================================================================
@@ -146,6 +147,20 @@ def shade(color, factor):
     return tuple(clamp(int(c * factor), 0, 255) for c in color)
 
 
+class FontAdapter:
+    """Small wrapper that lets pygame.font and pygame.freetype behave alike."""
+
+    def __init__(self, font, use_freetype=False):
+        self.font = font
+        self.use_freetype = use_freetype
+
+    def render(self, text, antialias, color):
+        if self.use_freetype:
+            surface, _ = self.font.render(text, color)
+            return surface
+        return self.font.render(text, antialias, color)
+
+
 class Toasts:
     def __init__(self):
         self.items = []
@@ -194,9 +209,16 @@ class Game:
         self.load_save()
 
     def load_font(self, size):
+        font_module = sys.modules.get('pygame.font')
+        if font_module and font_module.get_init():
+            if os.path.exists(FONT_PATH):
+                return FontAdapter(font_module.Font(FONT_PATH, size))
+            return FontAdapter(font_module.SysFont('dejavusans,arial', size))
+        if not pygame.freetype.get_init():
+            pygame.freetype.init()
         if os.path.exists(FONT_PATH):
-            return pygame.font.Font(FONT_PATH, size)
-        return pygame.font.SysFont('dejavusans,arial', size)
+            return FontAdapter(pygame.freetype.Font(FONT_PATH, size), use_freetype=True)
+        return FontAdapter(pygame.freetype.SysFont('dejavusans,arial', size), use_freetype=True)
 
     def reset_runtime(self):
         self.cash = 120
