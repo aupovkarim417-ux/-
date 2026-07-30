@@ -1,0 +1,13 @@
+# Runtime state
+pool.json
+settings.json
+
+# Local secrets; never commit real API keys
+groq_keys.json
+groq_keys.txt
+.env
+.env.*
+
+# Python cache
+__pycache__/
+*.py[cod]
