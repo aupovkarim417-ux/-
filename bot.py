@@ -1,5 +1,4 @@
 import asyncio
-import datetime
 import json
 import os
 import random
@@ -18,7 +17,9 @@ GROQ_CONTEXT_MESSAGES = int(os.getenv("GROQ_CONTEXT_MESSAGES", "8"))
 GROQ_CANDIDATE_POOL = int(os.getenv("GROQ_CANDIDATE_POOL", "40"))
 POOL_FILE = os.getenv("POOL_FILE", "pool.json")
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", "settings.json")
-REPLY_EVERY_N = int(os.getenv("REPLY_EVERY_N", "3"))
+MIN_REPLY_INTERVAL = 10
+REPLY_EVERY_N = max(MIN_REPLY_INTERVAL, int(os.getenv("REPLY_EVERY_N", str(MIN_REPLY_INTERVAL))))
+BACKFILL_HISTORY_LIMIT = int(os.getenv("BACKFILL_HISTORY_LIMIT", "500"))
 
 # Do not hardcode API keys in git. Use one of these environment variables:
 # GROQ_API_KEYS=gsk_key1,gsk_key2
@@ -123,7 +124,28 @@ bot = commands.Bot(
 all_messages: list[dict[str, Any]] = []
 sent_indices: set[int] = set()
 message_counters: dict[int, int] = defaultdict(int)
-reply_settings: dict[str, Any] = {"mode": "fixed", "n": REPLY_EVERY_N, "min": 1, "max": 20, "gen_mode": "smart"}
+reply_settings: dict[str, Any] = {"mode": "fixed", "n": REPLY_EVERY_N, "min": MIN_REPLY_INTERVAL, "max": 20, "gen_mode": "smart"}
+_known_message_keys: set[str] = set()
+
+
+def normalize_reply_settings() -> None:
+    """Keep classic reply interval enabled and never below 10 messages."""
+    reply_settings["mode"] = "fixed"
+    reply_settings["n"] = max(MIN_REPLY_INTERVAL, int(reply_settings.get("n", MIN_REPLY_INTERVAL)))
+    reply_settings["min"] = max(MIN_REPLY_INTERVAL, int(reply_settings.get("min", MIN_REPLY_INTERVAL)))
+    reply_settings["max"] = max(reply_settings["min"], int(reply_settings.get("max", reply_settings["min"])))
+
+
+def message_key(record: dict[str, Any]) -> str:
+    return f"{record.get('guild_id')}:{record.get('channel_id')}:{record.get('message_id')}"
+
+
+def rebuild_known_message_keys() -> None:
+    _known_message_keys.clear()
+    for record in all_messages:
+        key = message_key(record)
+        if not key.endswith(':None'):
+            _known_message_keys.add(key)
 
 
 def save_pool() -> None:
@@ -136,6 +158,7 @@ def load_pool() -> None:
     if os.path.exists(POOL_FILE):
         with open(POOL_FILE, "r", encoding="utf-8") as file:
             all_messages = json.load(file)
+    rebuild_known_message_keys()
 
 
 def save_settings() -> None:
@@ -147,6 +170,7 @@ def load_settings() -> None:
     if os.path.exists(SETTINGS_FILE):
         with open(SETTINGS_FILE, "r", encoding="utf-8") as file:
             reply_settings.update(json.load(file))
+    normalize_reply_settings()
 
 
 def _groq_active_key() -> str | None:
@@ -179,6 +203,51 @@ def _groq_on_fail(reason: str) -> None:
     _groq_fail_streak += 1
     if _groq_fail_streak >= GROQ_MAX_FAIL_STREAK:
         _groq_rotate(reason)
+
+
+def is_news_channel(channel: discord.abc.Messageable) -> bool:
+    channel_type = getattr(channel, "type", None)
+    if channel_type == discord.ChannelType.news:
+        return True
+    parent = getattr(channel, "parent", None)
+    return getattr(parent, "type", None) == discord.ChannelType.news
+
+
+def can_collect_message(message: discord.Message) -> bool:
+    if message.author.bot or is_news_channel(message.channel):
+        return False
+    return message.type in {discord.MessageType.default, discord.MessageType.reply}
+
+
+def add_record_to_pool(record: dict[str, Any]) -> bool:
+    key = message_key(record)
+    if key in _known_message_keys:
+        return False
+    all_messages.append(record)
+    if not key.endswith(':None'):
+        _known_message_keys.add(key)
+    return True
+
+
+async def backfill_guild_history() -> None:
+    """Load existing server messages so the bot can choose from more than live messages."""
+    added = 0
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            if is_news_channel(channel):
+                continue
+            permissions = channel.permissions_for(guild.me) if guild.me else None
+            if permissions and (not permissions.read_message_history or not permissions.view_channel):
+                continue
+            try:
+                async for message in channel.history(limit=BACKFILL_HISTORY_LIMIT):
+                    if can_collect_message(message):
+                        added += int(add_record_to_pool(message_to_record(message)))
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+    if added:
+        save_pool()
+    print(f"Backfill complete: added {added} messages; pool size {len(all_messages)}")
 
 
 def classify_url(url: str) -> str:
@@ -254,7 +323,9 @@ def message_to_record(message: discord.Message) -> dict[str, Any]:
         "content": message.content,
         "author": message.author.display_name,
         "author_id": str(message.author.id),
+        "message_id": message.id,
         "channel_id": message.channel.id,
+        "channel_type": str(getattr(message.channel, "type", "")),
         "guild_id": message.guild.id if message.guild else None,
         "created_at": message.created_at.isoformat(),
         "attachments": attachments,
@@ -285,6 +356,8 @@ def candidate_pool(exclude_content: str | None = None, kinds: list[str] | None =
     candidates: list[SmartCandidate] = []
     for index, record in enumerate(all_messages):
         if index in sent_indices or record.get("content") == exclude_content:
+            continue
+        if record.get("channel_type") == str(discord.ChannelType.news):
             continue
         candidate = make_candidate(index, record)
         if preferred_kinds and not preferred_kinds.intersection(candidate.kinds):
@@ -409,12 +482,8 @@ async def send_candidate(channel: discord.abc.Messageable, candidate: SmartCandi
 
 
 def next_reply_threshold() -> int:
-    if reply_settings.get("mode") == "random":
-        low, high = int(reply_settings.get("min", 1)), int(reply_settings.get("max", 20))
-        if low > high:
-            low, high = high, low
-        return random.randint(max(1, low), max(1, high))
-    return max(1, int(reply_settings.get("n", REPLY_EVERY_N)))
+    normalize_reply_settings()
+    return max(MIN_REPLY_INTERVAL, int(reply_settings.get("n", REPLY_EVERY_N)))
 
 
 channel_thresholds: dict[int, int] = defaultdict(next_reply_threshold)
@@ -425,6 +494,7 @@ async def on_ready() -> None:
     load_pool()
     load_settings()
     print(f"Logged in as {bot.user}; loaded {len(all_messages)} saved messages")
+    await backfill_guild_history()
 
 
 @bot.event
@@ -432,9 +502,13 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
 
-    if message.content or message.attachments or message.stickers:
-        all_messages.append(message_to_record(message))
-        save_pool()
+    if is_news_channel(message.channel):
+        await bot.process_commands(message)
+        return
+
+    if (message.content or message.attachments or message.stickers) and can_collect_message(message):
+        if add_record_to_pool(message_to_record(message)):
+            save_pool()
 
     await bot.process_commands(message)
 
@@ -460,6 +534,23 @@ async def set_generation_mode(ctx: commands.Context, mode: str) -> None:
     reply_settings["gen_mode"] = mode
     save_settings()
     await ctx.reply(f"Ок, режим генерации: {mode}")
+
+
+@bot.command(name="интервал")
+async def set_reply_interval(ctx: commands.Context, value: int | None = None) -> None:
+    if value is None:
+        await ctx.reply(f"Текущий интервал: {reply_settings['n']} сообщений. Минимум — {MIN_REPLY_INTERVAL}.")
+        return
+    if value < MIN_REPLY_INTERVAL:
+        await ctx.reply(f"Интервал нельзя убрать или поставить меньше {MIN_REPLY_INTERVAL} сообщений.")
+        return
+    reply_settings["mode"] = "fixed"
+    reply_settings["n"] = value
+    normalize_reply_settings()
+    save_settings()
+    channel_thresholds[ctx.channel.id] = next_reply_threshold()
+    message_counters[ctx.channel.id] = 0
+    await ctx.reply(f"Ок, бот будет отвечать раз в {reply_settings['n']} сообщений.")
 
 
 @bot.command(name="пул")
