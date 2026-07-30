@@ -16,6 +16,7 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GROQ_CONTEXT_MESSAGES = int(os.getenv("GROQ_CONTEXT_MESSAGES", "8"))
 GROQ_CANDIDATE_POOL = int(os.getenv("GROQ_CANDIDATE_POOL", "40"))
+GROQ_KEYS_FILE = os.getenv("GROQ_KEYS_FILE", "groq_keys.json")
 POOL_FILE = os.getenv("POOL_FILE", "pool.json")
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", "settings.json")
 MIN_REPLY_INTERVAL = 10
@@ -26,9 +27,36 @@ BACKFILL_HISTORY_LIMIT = int(os.getenv("BACKFILL_HISTORY_LIMIT", "500"))
 # GROQ_API_KEYS=gsk_key1,gsk_key2
 # GROQ_API_KEY_1=gsk_key1, GROQ_API_KEY_2=gsk_key2, ...
 # GROQ_API_KEY=gsk_single_key
+# Or put keys in an untracked GROQ_KEYS_FILE (default: groq_keys.json) as JSON list or newline text.
+
+
+def _load_keys_from_file(path: str) -> list[str]:
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as file:
+        raw = file.read().strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return [line.strip() for line in raw.splitlines() if line.strip()]
+    if isinstance(parsed, list):
+        return [str(key).strip() for key in parsed if str(key).strip()]
+    if isinstance(parsed, dict):
+        keys = parsed.get("keys") or parsed.get("GROQ_API_KEYS") or []
+        if isinstance(keys, str):
+            return [key.strip() for key in keys.split(",") if key.strip()]
+        if isinstance(keys, list):
+            return [str(key).strip() for key in keys if str(key).strip()]
+    return []
 
 
 def _load_groq_keys() -> list[str]:
+    file_keys = _load_keys_from_file(GROQ_KEYS_FILE)
+    if file_keys:
+        return file_keys
+
     multi = os.environ.get("GROQ_API_KEYS", "")
     if multi:
         keys = [key.strip() for key in multi.split(",") if key.strip()]
